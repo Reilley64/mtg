@@ -2,8 +2,7 @@ name: docker
 
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches: [master]
   workflow_dispatch:
 
 jobs:
@@ -15,10 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository }}
+      - id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
         with:
@@ -30,7 +27,6 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.img.outputs.name }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
