@@ -186,6 +186,12 @@ async fn fetch_convert_store(
 
 fn encode_webp(bytes: &[u8], quality: f32) -> Result<Vec<u8>> {
     let img = image::load_from_memory(bytes).context("decoding image")?;
+    // webp's from_image only takes RGB8/RGBA8; normalize grayscale/16-bit/etc. first.
+    let img = if img.color().has_alpha() {
+        image::DynamicImage::ImageRgba8(img.to_rgba8())
+    } else {
+        image::DynamicImage::ImageRgb8(img.to_rgb8())
+    };
     let encoder = webp::Encoder::from_image(&img).map_err(|e| anyhow!("webp encode: {e}"))?;
     let mem = if quality >= 100.0 {
         encoder.encode_lossless()
@@ -202,7 +208,7 @@ async fn download_to_file(client: &reqwest::Client, url: &str, path: &Path) -> R
     }
     let resp = client.get(url).send().await?.error_for_status()?;
     let mut stream = resp.bytes_stream();
-    // Write to a temp file then rename, so an interrupted download never poses as a cache hit.
+    // Write to a temp file, then rename it, so an interrupted download never poses as a cache hit.
     let tmp = path.with_extension("json.partial");
     let mut file = tokio::fs::File::create(&tmp).await?;
     while let Some(chunk) = stream.next().await {
@@ -211,4 +217,18 @@ async fn download_to_file(client: &reqwest::Client, url: &str, path: &Path) -> R
     file.flush().await?;
     tokio::fs::rename(&tmp, path).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_webp;
+
+    /// Grayscale (Luma8) source used to fail webp encoding with "Unimplemented".
+    #[test]
+    fn encodes_grayscale() {
+        let gray = image::DynamicImage::ImageLuma8(image::GrayImage::new(8, 8));
+        let mut png = std::io::Cursor::new(Vec::new());
+        gray.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        assert!(!encode_webp(png.get_ref(), 80.0).unwrap().is_empty());
+    }
 }
