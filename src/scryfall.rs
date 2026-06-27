@@ -105,10 +105,10 @@ impl Card {
     /// Image jobs for this card. Single-faced & split cards yield one (face 0);
     /// transform/MDFC cards yield one per face that carries its own art.
     pub fn jobs(&self, size: ImageSize) -> Vec<Job> {
-        if let Some(uris) = &self.image_uris {
-            if let Some(url) = uris.pick(size) {
-                return vec![self.job(url, 0)];
-            }
+        if let Some(uris) = &self.image_uris
+            && let Some(url) = uris.pick(size)
+        {
+            return vec![self.job(url, 0)];
         }
         self.card_faces
             .iter()

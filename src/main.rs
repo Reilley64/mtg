@@ -5,7 +5,6 @@ mod scryfall;
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
-    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -48,46 +47,65 @@ struct Args {
     limit: Option<usize>,
 }
 
+/// Per-run config shared by every download: the HTTP client and where/how to store.
+struct Puller {
+    client: reqwest::Client,
+    out: PathBuf,
+    image: ImageSize,
+    quality: f32,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
+    init_logging();
     let args = Args::parse();
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .build()?;
+    let puller = Puller {
+        client: reqwest::Client::builder().user_agent(USER_AGENT).build()?,
+        out: args.out.clone(),
+        image: args.image,
+        quality: args.quality,
+    };
+    tokio::fs::create_dir_all(&puller.out).await?;
 
-    tokio::fs::create_dir_all(&args.out).await?;
+    // 1. Discover the bulk feed. Two plain-text version markers (no struct/JSON):
+    //    `last-updated` = feed version of the last fully-clean run -> drives the short-circuit;
+    //    `.cache/<dataset>.version` = feed version of the cached bulk file -> drives re-download.
+    let info = scryfall::bulk_info(&puller.client, &args.dataset).await?;
+    let version = info.updated_at.as_str();
+    let bulk_path = puller.out.join(format!(".cache/{}.json", args.dataset));
+    let bulk_version_path = bulk_path.with_extension("version");
+    // "done" is per dataset+size (images live under <out>/<size>/); the bulk cache above is
+    // size-independent, so it stays keyed by dataset only.
+    let state_path = puller.out.join(format!(
+        ".cache/{}-{}.last-updated",
+        args.dataset,
+        args.image.to_possible_value().unwrap().get_name()
+    ));
 
-    // 1. Discover the bulk feed; bail early if nothing new has shipped since last run.
-    let info = scryfall::bulk_info(&client, &args.dataset).await?;
-    let state_path = args.out.join("last-updated");
-    // State is one timestamp string -> plain text file, no struct/JSON needed.
-    let last_pulled = std::fs::read_to_string(&state_path).ok();
-    let bulk_path = args.out.join(format!(".cache/{}.json", args.dataset));
-    if !args.refresh
-        && bulk_path.exists()
-        && last_pulled.as_deref() == Some(info.updated_at.as_str())
-    {
-        tracing::info!("no new cards since {}; nothing to do", info.updated_at);
+    // Nothing to do: the last clean run already covered this exact feed.
+    if !args.refresh && std::fs::read_to_string(&state_path).ok().as_deref() == Some(version) {
+        tracing::info!("no new cards since {version}; nothing to do");
         return Ok(());
     }
 
-    // Bulk feed is new/changed (or forced) -> (re)download it.
-    download_to_file(&client, &info.download_uri, &bulk_path).await?;
+    // (Re)download the bulk only when the cache is missing, stale, or forced. A partial-failure
+    // retry (e.g. a few unreleased-set 404s) thus reuses the cached file instead of re-fetching ~500MB.
+    if args.refresh
+        || !bulk_path.exists()
+        || std::fs::read_to_string(&bulk_version_path).ok().as_deref() != Some(version)
+    {
+        download_to_file(&puller.client, &info.download_uri, &bulk_path).await?;
+        std::fs::write(&bulk_version_path, version)
+            .with_context(|| format!("writing {bulk_version_path:?}"))?;
+    } else {
+        tracing::info!("reusing cached bulk {version}");
+    }
 
     // 2. Pull the shared card back first: it's the asset every deck needs, and a
     //    failure here means connectivity is broken before we commit to the full run.
     let back = scryfall::card_back_job(args.image);
-    if !dest_path(&args.out, &back, args.image).exists() {
-        fetch_convert_store(&client, &back, &args.out, args.image, args.quality)
-            .await
-            .context("pulling card back")?;
+    if !puller.dest_path(&back).exists() {
+        puller.store(&back).await.context("pulling card back")?;
     }
 
     // 3. Parse + derive image jobs.
@@ -102,28 +120,25 @@ async fn main() -> Result<()> {
     let n = jobs.len();
     let todo: Vec<Job> = jobs
         .into_iter()
-        .filter(|j| !dest_path(&args.out, j, args.image).exists())
+        .filter(|j| !puller.dest_path(j).exists())
         .collect();
     tracing::info!("{} already stored, {} to fetch", n - todo.len(), todo.len());
 
-    // 5. Fetch -> decode -> WebP -> store, bounded concurrency.
-    let done = Arc::new(AtomicUsize::new(0));
+    // 5. Fetch -> decode -> WebP -> store, bounded concurrency. Borrowed, not spawned,
+    //    so the futures can share &puller / &done without Arc or per-task clones.
+    let done = AtomicUsize::new(0);
     let total = todo.len();
+    let (puller, done) = (&puller, &done);
     stream::iter(todo)
-        .map(|job| {
-            let client = client.clone();
-            let root = args.out.clone();
-            let done = done.clone();
-            async move {
-                match fetch_convert_store(&client, &job, &root, args.image, args.quality).await {
-                    Ok(()) => {
-                        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n % 500 == 0 {
-                            tracing::info!("{n}/{total} stored");
-                        }
+        .map(|job| async move {
+            match puller.store(&job).await {
+                Ok(()) => {
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 500 == 0 {
+                        tracing::info!("{n}/{total} stored");
                     }
-                    Err(e) => tracing::warn!("{} ({}): {e:#}", job.id, job.url),
                 }
+                Err(e) => tracing::warn!("{} ({}): {e:#}", job.id, job.url),
             }
         })
         .buffer_unordered(args.concurrency)
@@ -146,42 +161,51 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Mirror Scryfall's URL layout: <size>/<front|back>/<id[0]>/<id[1]>/<id>.webp
-fn dest_path(root: &Path, job: &Job, size: ImageSize) -> PathBuf {
-    // ponytail: face 0 -> front, any other face -> back. MTG has no >2-face cards.
-    let face = if job.face == 0 { "front" } else { "back" };
-    // ValueEnum names (small/normal/large/png) are exactly Scryfall's size segments.
-    let seg = size.to_possible_value().unwrap().get_name().to_owned();
-    let (c0, c1) = (&job.id[0..1], &job.id[1..2]);
-    root.join(seg)
-        .join(face)
-        .join(c0)
-        .join(c1)
-        .join(format!("{}.webp", job.id))
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-async fn fetch_convert_store(
-    client: &reqwest::Client,
-    job: &Job,
-    root: &Path,
-    size: ImageSize,
-    quality: f32,
-) -> Result<()> {
-    let bytes = client
-        .get(&job.url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+impl Puller {
+    /// Mirror Scryfall's URL layout: <size>/<front|back>/<id[0]>/<id[1]>/<id>.webp
+    fn dest_path(&self, job: &Job) -> PathBuf {
+        // ponytail: face 0 -> front, any other face -> back. MTG has no >2-face cards.
+        let face = if job.face == 0 { "front" } else { "back" };
+        // ValueEnum names (small/normal/large/png) are exactly Scryfall's size segments.
+        let seg = self.image.to_possible_value().unwrap().get_name().to_owned();
+        let (c0, c1) = (&job.id[0..1], &job.id[1..2]);
+        self.out
+            .join(seg)
+            .join(face)
+            .join(c0)
+            .join(c1)
+            .join(format!("{}.webp", job.id))
+    }
 
-    // Decode + encode are CPU-bound and synchronous -> off the async runtime.
-    let webp = tokio::task::spawn_blocking(move || encode_webp(&bytes, quality)).await??;
+    /// Download one image, convert to WebP, write it to its deterministic path.
+    async fn store(&self, job: &Job) -> Result<()> {
+        let bytes = self
+            .client
+            .get(&job.url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
 
-    let dest = dest_path(root, job, size);
-    tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
-    tokio::fs::write(&dest, webp).await?;
-    Ok(())
+        // Decode + encode are CPU-bound and synchronous -> off the async runtime.
+        let quality = self.quality;
+        let webp = tokio::task::spawn_blocking(move || encode_webp(&bytes, quality)).await??;
+
+        // Write to a temp sibling then rename: a kill mid-write must not leave a
+        // truncated file that the skip-existing check would treat as complete.
+        let dest = self.dest_path(job);
+        tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
+        let tmp = dest.with_extension("webp.partial");
+        tokio::fs::write(&tmp, webp).await?;
+        tokio::fs::rename(&tmp, &dest).await?;
+        Ok(())
+    }
 }
 
 fn encode_webp(bytes: &[u8], quality: f32) -> Result<Vec<u8>> {
