@@ -31,7 +31,7 @@ struct Args {
     image: ImageSize,
 
     /// WebP quality 0-100; 100 = lossless.
-    #[arg(long, default_value_t = 80.0)]
+    #[arg(long, default_value_t = 100.0)]
     quality: f32,
 
     /// Concurrent image downloads.
@@ -182,20 +182,31 @@ impl Puller {
             .join(format!("{}.webp", job.id))
     }
 
+    /// GET image bytes; `Ok(None)` means 404, so the caller can try a fallback.
+    async fn fetch(&self, url: &str) -> Result<Option<Vec<u8>>> {
+        let resp = self.client.get(url).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.bytes().await?.to_vec()))
+    }
+
     /// Download one image, convert to WebP, write it to its deterministic path.
     async fn store(&self, job: &Job) -> Result<()> {
-        let bytes = self
-            .client
-            .get(&job.url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+        let bytes = match self.fetch(&job.url).await? {
+            Some(b) => b,
+            // Chosen size not on the CDN yet (common for unreleased sets) -> fall back to png.
+            None => {
+                let fb = job.fallback.as_deref().context("image not found (404)")?;
+                self.fetch(fb)
+                    .await?
+                    .context("image not found (404, incl. png fallback)")?
+            }
+        };
 
         // Decode + encode are CPU-bound and synchronous -> off the async runtime.
-        let quality = self.quality;
-        let webp = tokio::task::spawn_blocking(move || encode_webp(&bytes, quality)).await??;
+        let (quality, max) = (self.quality, self.image.dims());
+        let webp = tokio::task::spawn_blocking(move || encode_webp(&bytes, quality, max)).await??;
 
         // Write to a temp sibling then rename: a kill mid-write must not leave a
         // truncated file that the skip-existing check would treat as complete.
@@ -208,14 +219,21 @@ impl Puller {
     }
 }
 
-fn encode_webp(bytes: &[u8], quality: f32) -> Result<Vec<u8>> {
-    let img = image::load_from_memory(bytes).context("decoding image")?;
-    // webp's from_image only takes RGB8/RGBA8; normalize grayscale/16-bit/etc. first.
-    let img = if img.color().has_alpha() {
-        image::DynamicImage::ImageRgba8(img.to_rgba8())
+fn encode_webp(bytes: &[u8], quality: f32, max: (u32, u32)) -> Result<Vec<u8>> {
+    let mut img = image::load_from_memory(bytes).context("decoding image")?;
+    // Downscale only if oversized (the png fallback): Lanczos3 preserves aspect and keeps text
+    // crisp; primary images already match `max` so this is a no-op for them.
+    if img.width() > max.0 || img.height() > max.1 {
+        img = img.resize(max.0, max.1, image::imageops::FilterType::Lanczos3);
+    }
+    // webp's from_image only takes RGB8/RGBA8; normalize grayscale/16-bit/etc. to RGB8 and
+    // flatten any transparency (png corners) onto black so output is consistently opaque.
+    let rgb = if img.color().has_alpha() {
+        flatten_over_black(&img.to_rgba8())
     } else {
-        image::DynamicImage::ImageRgb8(img.to_rgb8())
+        img.to_rgb8()
     };
+    let img = image::DynamicImage::ImageRgb8(rgb);
     let encoder = webp::Encoder::from_image(&img).map_err(|e| anyhow!("webp encode: {e}"))?;
     let mem = if quality >= 100.0 {
         encoder.encode_lossless()
@@ -223,6 +241,19 @@ fn encode_webp(bytes: &[u8], quality: f32) -> Result<Vec<u8>> {
         encoder.encode(quality)
     };
     Ok(mem.to_vec())
+}
+
+/// Composite an RGBA image onto a black background, dropping the alpha channel.
+fn flatten_over_black(rgba: &image::RgbaImage) -> image::RgbImage {
+    image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let p = rgba.get_pixel(x, y).0;
+        let a = p[3] as u16;
+        image::Rgb([
+            (p[0] as u16 * a / 255) as u8,
+            (p[1] as u16 * a / 255) as u8,
+            (p[2] as u16 * a / 255) as u8,
+        ])
+    })
 }
 
 async fn download_to_file(client: &reqwest::Client, url: &str, path: &Path) -> Result<()> {
@@ -253,6 +284,25 @@ mod tests {
         let gray = image::DynamicImage::ImageLuma8(image::GrayImage::new(8, 8));
         let mut png = std::io::Cursor::new(Vec::new());
         gray.write_to(&mut png, image::ImageFormat::Png).unwrap();
-        assert!(!encode_webp(png.get_ref(), 80.0).unwrap().is_empty());
+        assert!(!encode_webp(png.get_ref(), 80.0, (4096, 4096)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn flatten_drops_transparency_to_black() {
+        let mut img = image::RgbaImage::new(2, 2);
+        img.put_pixel(0, 0, image::Rgba([255, 255, 255, 0])); // transparent -> black
+        img.put_pixel(1, 1, image::Rgba([10, 20, 30, 255])); // opaque -> unchanged
+        let rgb = super::flatten_over_black(&img);
+        assert_eq!(rgb.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(rgb.get_pixel(1, 1).0, [10, 20, 30]);
+    }
+
+    /// A transparent png (the shape of the png fallback) must encode without error.
+    #[test]
+    fn encodes_transparent_png() {
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(8, 8));
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        assert!(!encode_webp(png.get_ref(), 80.0, (4096, 4096)).unwrap().is_empty());
     }
 }

@@ -94,9 +94,23 @@ pub enum ImageSize {
     Png,
 }
 
+impl ImageSize {
+    /// Scryfall's fixed pixel dimensions for each size — the target a png fallback is downscaled to.
+    pub fn dims(self) -> (u32, u32) {
+        match self {
+            ImageSize::Small => (146, 204),
+            ImageSize::Normal => (488, 680),
+            ImageSize::Large => (672, 936),
+            ImageSize::Png => (745, 1040),
+        }
+    }
+}
+
 /// One downloadable image (a card, or one face of a multi-faced card).
 pub struct Job {
     pub url: String,
+    /// `png` URL to try if `url` 404s — new sets often lack some sizes on the CDN while png exists.
+    pub fallback: Option<String>,
     pub id: String,
     pub face: usize,
 }
@@ -108,17 +122,24 @@ impl Card {
         if let Some(uris) = &self.image_uris
             && let Some(url) = uris.pick(size)
         {
-            return vec![self.job(url, 0)];
+            return vec![self.job(uris, url, size, 0)];
         }
         self.card_faces
             .iter()
             .enumerate()
-            .filter_map(|(i, f)| Some(self.job(f.image_uris.as_ref()?.pick(size)?, i)))
+            .filter_map(|(i, f)| {
+                let uris = f.image_uris.as_ref()?;
+                Some(self.job(uris, uris.pick(size)?, size, i))
+            })
             .collect()
     }
 
-    fn job(&self, url: &str, face: usize) -> Job {
-        Job { url: url.to_string(), id: self.id.clone(), face }
+    fn job(&self, uris: &ImageUris, url: &str, size: ImageSize, face: usize) -> Job {
+        let fallback = match size {
+            ImageSize::Png => None,
+            _ => uris.png.clone().filter(|p| p != url),
+        };
+        Job { url: url.to_string(), fallback, id: self.id.clone(), face }
     }
 }
 
@@ -136,6 +157,7 @@ pub fn card_back_job(size: ImageSize) -> Job {
     let (c0, c1) = (&CARD_BACK_ID[0..1], &CARD_BACK_ID[1..2]);
     Job {
         url: format!("https://backs.scryfall.io/{seg}/{c0}/{c1}/{CARD_BACK_ID}.{ext}"),
+        fallback: None,
         id: CARD_BACK_ID.to_string(),
         face: 0,
     }
