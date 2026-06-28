@@ -75,14 +75,21 @@ struct ImageUris {
 }
 
 impl ImageUris {
-    fn pick(&self, size: ImageSize) -> Option<&str> {
+    /// Candidate (size, url) pairs to try in order: the requested size first, then the rest by
+    /// descending resolution (a bigger image downscales cleanly). New sets often have only some
+    /// sizes live on the CDN, so we try every available one rather than giving up on the first 404.
+    fn urls(&self, size: ImageSize) -> Vec<(ImageSize, String)> {
+        use ImageSize::*;
         let chain = match size {
-            ImageSize::Png => [&self.png, &self.large, &self.normal, &self.small],
-            ImageSize::Large => [&self.large, &self.normal, &self.png, &self.small],
-            ImageSize::Normal => [&self.normal, &self.large, &self.small, &self.png],
-            ImageSize::Small => [&self.small, &self.normal, &self.large, &self.png],
+            Png => [(Png, &self.png), (Large, &self.large), (Normal, &self.normal), (Small, &self.small)],
+            Large => [(Large, &self.large), (Png, &self.png), (Normal, &self.normal), (Small, &self.small)],
+            Normal => [(Normal, &self.normal), (Png, &self.png), (Large, &self.large), (Small, &self.small)],
+            Small => [(Small, &self.small), (Png, &self.png), (Large, &self.large), (Normal, &self.normal)],
         };
-        chain.into_iter().flatten().next().map(String::as_str)
+        chain
+            .into_iter()
+            .filter_map(|(s, u)| u.clone().map(|u| (s, u)))
+            .collect()
     }
 }
 
@@ -108,9 +115,8 @@ impl ImageSize {
 
 /// One downloadable image (a card, or one face of a multi-faced card).
 pub struct Job {
-    pub url: String,
-    /// `png` URL to try if `url` 404s — new sets often lack some sizes on the CDN while png exists.
-    pub fallback: Option<String>,
+    /// Candidate (size, url) pairs in preference order; `store` tries each until one isn't a 404.
+    pub candidates: Vec<(ImageSize, String)>,
     pub id: String,
     pub face: usize,
 }
@@ -119,27 +125,20 @@ impl Card {
     /// Image jobs for this card. Single-faced & split cards yield one (face 0);
     /// transform/MDFC cards yield one per face that carries its own art.
     pub fn jobs(&self, size: ImageSize) -> Vec<Job> {
-        if let Some(uris) = &self.image_uris
-            && let Some(url) = uris.pick(size)
-        {
-            return vec![self.job(uris, url, size, 0)];
+        if let Some(uris) = &self.image_uris {
+            let candidates = uris.urls(size);
+            if !candidates.is_empty() {
+                return vec![Job { candidates, id: self.id.clone(), face: 0 }];
+            }
         }
         self.card_faces
             .iter()
             .enumerate()
             .filter_map(|(i, f)| {
-                let uris = f.image_uris.as_ref()?;
-                Some(self.job(uris, uris.pick(size)?, size, i))
+                let candidates = f.image_uris.as_ref()?.urls(size);
+                (!candidates.is_empty()).then(|| Job { candidates, id: self.id.clone(), face: i })
             })
             .collect()
-    }
-
-    fn job(&self, uris: &ImageUris, url: &str, size: ImageSize, face: usize) -> Job {
-        let fallback = match size {
-            ImageSize::Png => None,
-            _ => uris.png.clone().filter(|p| p != url),
-        };
-        Job { url: url.to_string(), fallback, id: self.id.clone(), face }
     }
 }
 
@@ -156,8 +155,8 @@ pub fn card_back_job(size: ImageSize) -> Job {
     };
     let (c0, c1) = (&CARD_BACK_ID[0..1], &CARD_BACK_ID[1..2]);
     Job {
-        url: format!("https://backs.scryfall.io/{seg}/{c0}/{c1}/{CARD_BACK_ID}.{ext}"),
-        fallback: None,
+        // The universal back is long-released and exists at every size, so no fallbacks needed.
+        candidates: vec![(size, format!("https://backs.scryfall.io/{seg}/{c0}/{c1}/{CARD_BACK_ID}.{ext}"))],
         id: CARD_BACK_ID.to_string(),
         face: 0,
     }
